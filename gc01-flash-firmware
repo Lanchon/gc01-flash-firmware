@@ -10,20 +10,20 @@ set -Eeuo pipefail
 MAX_FW_SIZE="$(( 1 * 1024 * 1024 ))"
 
 MAX_DEV_SIZE="$(( 200 * 1024 * 1024 ))"
-USED_DEV_SIZE="$(( 1 * 1024 * 1024 + MAX_FW_SIZE ))"
+MAX_USED_DEV_SIZE="$(( 1 * 1024 * 1024 + MAX_FW_SIZE ))"
 
-USED_DEV_SECTORS="$(( USED_DEV_SIZE / 2048 ))"
+MAX_USED_DEV_SECTORS="$(( MAX_USED_DEV_SIZE / 2048 ))"
 
 if [[ $# -ne 2 ]]; then
     echo "usage: $(basename "$0") [firmware-file] [gc01-block-device]" >&2
     exit 1
 fi
 
-FILE="$1"
+FW="$1"
 DEV="$2"
 
-if [[ ! -f "$FILE" ]]; then
-    echo "file does not exist: $FILE" >&2
+if [[ ! -f "$FW" ]]; then
+    echo "file does not exist: $FW" >&2
     exit 1
 fi
 
@@ -43,9 +43,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "verifying firmware file size..."
-FILE_SIZE="$(stat -c %s "$FILE")"
-if (( FILE_SIZE > MAX_FW_SIZE )); then
-    echo "file is too large: $FILE" >&2
+FW_SIZE="$(stat -c %s "$FW")"
+if (( FW_SIZE > MAX_FW_SIZE )); then
+    echo "file is too large: $FW" >&2
     exit 1
 fi
 
@@ -83,7 +83,7 @@ echo "copying device to temporary image..."
 dd if="$DEV" \
    of="$TMP_IMG" \
    bs=2K \
-   count="$USED_DEV_SECTORS" \
+   count="$MAX_USED_DEV_SECTORS" \
    iflag=direct \
    status=progress
 
@@ -132,7 +132,7 @@ if [[ "$FILE_SIZE" != "0" ]]; then
 fi
 
 echo "writing firmware..."
-cp -- "$FILE" "$MNT_DIR/FIRMWARE.BIN"
+cp -- "$FW" "$MNT_DIR/FIRMWARE.BIN"
 
 echo "unmounting loop device..."
 umount "$MNT_DIR"
@@ -141,7 +141,30 @@ echo "destroying loop device..."
 losetup -d "$LOOPDEV"
 LOOPDEV=""
 
-echo "writing image back to device..."
+echo "verifying firmware is contiguous within image..."
+FW_HEX="$(
+	xxd -p "$FW" |
+	tr -d '\n'
+)"
+FW_OFFSET_CHARS="$(
+    xxd -p "$TMP_IMG" |
+    tr -d '\n' |
+    grep -oba "$FW_HEX" |
+    head -n1 |
+    cut -d: -f1
+)"
+FW_HEX=
+if [[ -z "$FW_OFFSET_CHARS" ]]; then
+    echo "firmware was not stored contiguously within image" >&2
+    exit 1
+fi
+
+FW_OFFSET="$(( FW_OFFSET_CHARS / 2 ))"
+printf 'firmware offset within image: 0x%X\n' "$FW_OFFSET"
+
+USED_DEV_SECTORS="$(( ((FW_OFFSET + FW_SIZE) + (2048 - 1)) / 2048 ))"
+
+echo "writing partial image back to device..."
 dd if="$TMP_IMG" \
    of="$DEV" \
    bs=2K \
@@ -150,3 +173,4 @@ dd if="$TMP_IMG" \
    conv=fsync \
    status=progress
 
+echo "done"
