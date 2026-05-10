@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+# FNRISI GC-01 Firmware Flasher for Linux
+
+# Author: Lanchon
+# License: GPLv3+
+
+set -Eeuo pipefail
+
+MAX_FW_SIZE="$(( 1 * 1024 * 1024 ))"
+
+MAX_DEV_SIZE="$(( 200 * 1024 * 1024 ))"
+USED_DEV_SIZE="$(( 1 * 1024 * 1024 + MAX_FW_SIZE ))"
+
+USED_DEV_SECTORS="$(( USED_DEV_SIZE / 2048 ))"
+
+if [[ $# -ne 2 ]]; then
+    echo "usage: $(basename "$0") [firmware-file] [gc01-block-device]" >&2
+    exit 1
+fi
+
+FILE="$1"
+DEV="$2"
+
+if [[ ! -f "$FILE" ]]; then
+    echo "file does not exist: $FILE" >&2
+    exit 1
+fi
+
+if [[ ! -b "$DEV" ]]; then
+    echo "not a block device: $DEV" >&2
+    exit 1
+fi
+
+if findmnt -rn -S "$DEV" >/dev/null; then
+    echo "device is mounted: $DEV" >&2
+    exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    echo "must be run as root" >&2
+    exit 1
+fi
+
+echo "verifying firmware file size..."
+FILE_SIZE="$(stat -c %s "$FILE")"
+if (( FILE_SIZE > MAX_FW_SIZE )); then
+    echo "file is too large: $FILE" >&2
+    exit 1
+fi
+
+echo "verifying block device size..."
+DEV_SIZE="$(blockdev --getsize64 "$DEV")"
+if (( DEV_SIZE > MAX_DEV_SIZE )); then
+    echo "device is too large: $DEV" >&2
+    exit 1
+fi
+
+TMP_IMG="$(mktemp --tmpdir gc01-fw-XXXXXX.img)"
+MNT_DIR="$(mktemp -d --tmpdir gc01-fw-mnt-XXXXXX)"
+LOOPDEV=""
+
+cleanup() {
+    set +e
+
+    sync
+
+    if mountpoint -q "$MNT_DIR"; then
+        umount "$MNT_DIR"
+    fi
+
+    if [[ -n "$LOOPDEV" ]]; then
+        losetup -d "$LOOPDEV"
+    fi
+
+    rm -rf "$MNT_DIR"
+    rm -f "$TMP_IMG"
+}
+
+trap cleanup EXIT
+
+echo "copying device to temporary image..."
+dd if="$DEV" \
+   of="$TMP_IMG" \
+   bs=2K \
+   count="$USED_DEV_SECTORS" \
+   iflag=direct \
+   status=progress
+
+sync
+
+echo "creating loop device..."
+LOOPDEV="$(losetup --find --show "$TMP_IMG")"
+
+echo "mounting loop device..."
+mount -o sync "$LOOPDEV" "$MNT_DIR"
+
+echo "verifying filesystem label..."
+DEVL_LABEL="$(blkid -s LABEL -o value "$LOOPDEV" || true)"
+if [[ "$DEVL_LABEL" != "BOOTLOADER" ]]; then
+    echo "unexpected volume label: $DEVL_LABEL" >&2
+    exit 1
+fi
+
+echo "verifying filesystem contents..."
+
+mapfile -t FILES < <(
+    find "$MNT_DIR" \
+        -type f \
+        -printf '%f\n'
+)
+
+if [[ ${#FILES[@]} -ne 1 ]]; then
+    echo "expected exactly one file" >&2
+    exit 1
+fi
+
+case "${FILES[0]}" in
+    READY.TXT)
+        ;;
+    *)
+        echo "found unexpected file: ${FILES[0]}" >&2
+        exit 1
+        ;;
+esac
+
+FILE_PATH="$MNT_DIR/${FILES[0]}"
+FILE_SIZE="$(stat -c %s "$FILE_PATH")"
+if [[ "$FILE_SIZE" != "0" ]]; then
+    echo "${FILES[0]} must be zero length" >&2
+    exit 1
+fi
+
+echo "writing firmware..."
+cp -- "$FILE" "$MNT_DIR/FIRMWARE.BIN"
+
+echo "unmounting loop device..."
+umount "$MNT_DIR"
+
+echo "destroying loop device..."
+losetup -d "$LOOPDEV"
+LOOPDEV=""
+
+echo "writing image back to device..."
+dd if="$TMP_IMG" \
+   of="$DEV" \
+   bs=2K \
+   count="$USED_DEV_SECTORS" \
+   oflag=direct \
+   conv=fsync \
+   status=progress
+
